@@ -1,4 +1,4 @@
-name: Auto-Build S24FE Shizuku APK
+name: Auto-Build S24FE Hybrid v4 APK
 
 on:
   push:
@@ -19,9 +19,11 @@ jobs:
         with:
           gradle-version: '8.6'
 
-      - name: Generate Shizuku App Source Code
+      - name: Generate Hybrid v4 App Source Code & Custom Icon
         run: |
           mkdir -p app/src/main/java/com/example/exynostemp
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
 
           cat << 'EOF' > gradle.properties
           android.useAndroidX=true
@@ -59,8 +61,8 @@ jobs:
                   applicationId = "com.example.exynostemp"
                   minSdk = 29
                   targetSdk = 34
-                  versionCode = 3
-                  versionName = "3.0-Shizuku"
+                  versionCode = 4
+                  versionName = "4.0-Hybrid"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -79,6 +81,80 @@ jobs:
           }
           EOF
 
+          # 1. Custom App Icon Background (Dark Slate/Navy)
+          cat << 'EOF' > app/src/main/res/drawable/ic_launcher_background.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#0D131A"
+                  android:pathData="M0,0h108v108h-108z" />
+              <path
+                  android:fillColor="#16222F"
+                  android:pathData="M18,18h72v72h-72z" />
+          </vector>
+          EOF
+
+          # 2. Custom App Icon Foreground (Exynos CPU Chip + Cyan/Red Thermal Core)
+          cat << 'EOF' > app/src/main/res/drawable/ic_launcher_foreground.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <!-- Gold/Cyan CPU Pins Top & Bottom -->
+              <path
+                  android:fillColor="#00FFCC"
+                  android:pathData="M39,22h4v8h-4z M52,22h4v8h-4z M65,22h4v8h-4z M39,78h4v8h-4z M52,78h4v8h-4z M65,78h4v8h-4z" />
+              <!-- Gold/Cyan CPU Pins Left & Right -->
+              <path
+                  android:fillColor="#00FFCC"
+                  android:pathData="M22,39h8v4h-8z M22,52h8v4h-8z M22,65h8v4h-8z M78,39h8v4h-8z M78,52h8v4h-8z M78,65h8v4h-8z" />
+              <!-- Outer CPU Die Frame -->
+              <path
+                  android:fillColor="#1E2D3D"
+                  android:strokeColor="#00FFCC"
+                  android:strokeWidth="2.5"
+                  android:pathData="M32,32h44v44h-44z" />
+              <!-- Inner Silicon Core -->
+              <path
+                  android:fillColor="#0A1017"
+                  android:pathData="M38,38h32v32h-32z" />
+              <!-- Glowing Red Thermal Core Indicator -->
+              <path
+                  android:fillColor="#FF3B30"
+                  android:pathData="M54,57m-8,0a8,8 0,1 1,16 0a8,8 0,1 1,-16 0" />
+              <path
+                  android:fillColor="#FF3B30"
+                  android:pathData="M51,41h6v14h-6z" />
+              <!-- White Center Highlight -->
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M54,57m-3,0a3,3 0,1 1,6 0a3,3 0,1 1,-6 0" />
+          </vector>
+          EOF
+
+          # 3. Adaptive Icon Wrapper for Android 8.0+ (One UI Home Screen Support)
+          cat << 'EOF' > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF
+
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -90,6 +166,8 @@ jobs:
               <application
                   android:allowBackup="true"
                   android:label="S24FE Thermal"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
                   android:supportsRtl="true"
                   android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
 
@@ -131,19 +209,25 @@ jobs:
           import android.content.IntentFilter
           import android.content.pm.PackageManager
           import android.os.BatteryManager
+          import android.os.Build
+          import android.os.PowerManager
           import rikka.shizuku.Shizuku
+          import java.io.File
+          import java.io.RandomAccessFile
 
           data class ThermalSnapshot(
-              val cpuTempC: Float?,
-              val gpuTempC: Float?,
-              val socSkinTempC: Float?,
+              val cpuTempC: Float,
+              val gpuTempC: Float,
               val batteryTempC: Float,
-              val shizukuActive: Boolean
+              val isExactHardware: Boolean
           )
 
           class ExynosThermalReader(private val context: Context) {
 
+              private val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
               private val tempLineRegex = Regex("""Temperature\{mValue=([-0-9.]+),\s*mType=([0-9]+),\s*mName=([^,\s}]+)""")
+              private var lastHeadroomTime = 0L
+              private var cachedHeadroom = Float.NaN
 
               fun isShizukuReady(): Boolean {
                   return try {
@@ -155,16 +239,43 @@ jobs:
 
               fun readTemperatures(): ThermalSnapshot {
                   val batTemp = readBatteryTemp()
-                  if (!isShizukuReady()) {
-                      return ThermalSnapshot(null, null, null, batTemp, false)
+
+                  // 1. Try Shizuku Real Hardware Sensor Reading First
+                  if (isShizukuReady()) {
+                      val shizukuResult = tryReadViaShizuku(batTemp)
+                      if (shizukuResult != null) return shizukuResult
                   }
 
+                  // 2. Automatic Hybrid Fallback when Shizuku is OFF
+                  val headroom = getHeadroomSafe()
+                  val status = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) powerManager.currentThermalStatus else 0
+                  val cpuLoadRatio = readCpuFreqLoadRatio()
+
+                  val estCpu: Float
+                  val estGpu: Float
+                  if (!headroom.isNaN() && headroom > 0.05f) {
+                      estCpu = (batTemp + (headroom * 26f) + (cpuLoadRatio * 5f)).coerceIn(batTemp, 95f)
+                      estGpu = (batTemp + (headroom * 22f) + (cpuLoadRatio * 3.5f)).coerceIn(batTemp, 90f)
+                  } else {
+                      val statusBoost = status * 5.0f
+                      estCpu = batTemp + 4.8f + (cpuLoadRatio * 10f) + statusBoost
+                      estGpu = batTemp + 0.5f + (cpuLoadRatio * 8f) + statusBoost
+                  }
+
+                  return ThermalSnapshot(
+                      cpuTempC = estCpu,
+                      gpuTempC = estGpu,
+                      batteryTempC = batTemp,
+                      isExactHardware = false
+                  )
+              }
+
+              private fun tryReadViaShizuku(batTemp: Float): ThermalSnapshot? {
                   val cpuList = mutableListOf<Float>()
                   val gpuList = mutableListOf<Float>()
                   val skinList = mutableListOf<Float>()
 
                   try {
-                      // Invoke privileged ADB shell command via Shizuku
                       val newProcessMethod = Shizuku::class.java.getDeclaredMethod(
                           "newProcess",
                           Array<String>::class.java,
@@ -215,7 +326,7 @@ jobs:
                                       when {
                                           type == 0 || name.contains("BIG") || name.contains("MID") || name.contains("LITTLE") || name.contains("CPU") -> cpuList.add(tempC)
                                           type == 1 || name.contains("G3D") || name.contains("GPU") -> gpuList.add(tempC)
-                                          type == 3 || name.contains("SKIN") || name.contains("SOC") || name.contains("AP") || name.contains("ISP") || name.contains("NPU") -> skinList.add(tempC)
+                                          type == 3 || name.contains("SKIN") || name.contains("SOC") || name.contains("AP") -> skinList.add(tempC)
                                       }
                                   }
                               }
@@ -234,15 +345,46 @@ jobs:
                               }
                           }
                       }
-                  } catch (_: Exception) {}
+                  } catch (_: Exception) {
+                      return null
+                  }
 
-                  return ThermalSnapshot(
-                      cpuTempC = cpuList.maxOrNull(),
-                      gpuTempC = gpuList.maxOrNull(),
-                      socSkinTempC = skinList.maxOrNull(),
-                      batteryTempC = batTemp,
-                      shizukuActive = true
-                  )
+                  val finalCpu = cpuList.maxOrNull() ?: skinList.maxOrNull()
+                  val finalGpu = gpuList.maxOrNull() ?: skinList.maxOrNull()
+
+                  return if (finalCpu != null && finalGpu != null) {
+                      ThermalSnapshot(finalCpu, finalGpu, batTemp, true)
+                  } else null
+              }
+
+              private fun readCpuFreqLoadRatio(): Float {
+                  var totalRatio = 0f
+                  var readableCores = 0
+                  for (i in 0..9) {
+                      try {
+                          val curFile = File("/sys/devices/system/cpu/cpu$i/cpufreq/scaling_cur_freq")
+                          val maxFile = File("/sys/devices/system/cpu/cpu$i/cpufreq/scaling_max_freq")
+                          if (curFile.canRead() && maxFile.canRead()) {
+                              val cur = RandomAccessFile(curFile, "r").use { it.readLine()?.trim()?.toFloatOrNull() }
+                              val max = RandomAccessFile(maxFile, "r").use { it.readLine()?.trim()?.toFloatOrNull() }
+                              if (cur != null && max != null && max > 0f) {
+                                  totalRatio += (cur / max)
+                                  readableCores++
+                              }
+                          }
+                      } catch (_: Exception) {}
+                  }
+                  return if (readableCores > 0) (totalRatio / readableCores).coerceIn(0.1f, 1.0f) else 0.25f
+              }
+
+              private fun getHeadroomSafe(): Float {
+                  val now = System.currentTimeMillis()
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (now - lastHeadroomTime > 11_000L)) {
+                      lastHeadroomTime = now
+                      val hr = powerManager.getThermalHeadroom(0)
+                      if (!hr.isNaN() && hr > 0f) cachedHeadroom = hr
+                  }
+                  return cachedHeadroom
               }
 
               private fun readBatteryTemp(): Float {
@@ -267,6 +409,9 @@ jobs:
           import android.graphics.Typeface
           import android.os.Build
           import android.os.IBinder
+          import android.text.SpannableStringBuilder
+          import android.text.Spanned
+          import android.text.style.ForegroundColorSpan
           import android.view.*
           import android.widget.TextView
           import androidx.core.app.NotificationCompat
@@ -280,6 +425,10 @@ jobs:
               private lateinit var thermalReader: ExynosThermalReader
               private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
               private var pollingJob: Job? = null
+
+              private val colorNormal = Color.parseColor("#00FFCC") // Cool Cyan
+              private val colorHot = Color.parseColor("#FF3B30")    // Warning Red
+              private val colorDivider = Color.parseColor("#CCCCCC")
 
               private val screenStateReceiver = object : BroadcastReceiver() {
                   override fun onReceive(context: Context?, intent: Intent?) {
@@ -307,10 +456,9 @@ jobs:
 
               private fun setupFloatingOverlay() {
                   overlayTextView = TextView(this).apply {
-                      setTextColor(Color.parseColor("#00FFCC"))
+                      setTextColor(colorNormal)
                       textSize = 12f
                       typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-                      // 100% Clear background with high-contrast black drop shadow for visibility
                       setBackgroundColor(Color.TRANSPARENT)
                       setShadowLayer(6f, 2f, 2f, Color.BLACK)
                       setPadding(12, 6, 12, 6)
@@ -363,8 +511,8 @@ jobs:
                   pollingJob = serviceScope.launch {
                       while (isActive) {
                           val snap = thermalReader.readTemperatures()
-                          val displayString = buildDisplayText(snap)
-                          withContext(Dispatchers.Main) { overlayTextView.text = displayString }
+                          val styledText = buildColoredDisplayText(snap)
+                          withContext(Dispatchers.Main) { overlayTextView.text = styledText }
                           delay(3000L)
                       }
                   }
@@ -375,16 +523,32 @@ jobs:
                   pollingJob = null
               }
 
-              private fun buildDisplayText(snap: ThermalSnapshot): String {
-                  if (!snap.shizukuActive) {
-                      return String.format(Locale.US, "[No Shizuku] Bat: %.1f°C", snap.batteryTempC)
-                  }
-                  val cpu = snap.cpuTempC ?: snap.socSkinTempC
-                  val gpu = snap.gpuTempC ?: snap.socSkinTempC
-                  val cpuStr = cpu?.let { String.format(Locale.US, "%.1f°C", it) } ?: "--"
-                  val gpuStr = gpu?.let { String.format(Locale.US, "%.1f°C", it) } ?: "--"
-                  val batStr = String.format(Locale.US, "%.1f°C", snap.batteryTempC)
-                  return "CPU: $cpuStr | GPU: $gpuStr | Bat: $batStr"
+              private fun buildColoredDisplayText(snap: ThermalSnapshot): CharSequence {
+                  val builder = SpannableStringBuilder()
+                  val prefix = if (snap.isExactHardware) "" else "~"
+
+                  val cpuText = String.format(Locale.US, "CPU: %s%.1f°C", prefix, snap.cpuTempC)
+                  val gpuText = String.format(Locale.US, "GPU: %s%.1f°C", prefix, snap.gpuTempC)
+                  val batText = String.format(Locale.US, "Bat: %.1f°C", snap.batteryTempC)
+
+                  // Thresholds requested: CPU >= 65°C, GPU >= 60°C, Battery >= 40°C
+                  val cpuColor = if (snap.cpuTempC >= 65.0f) colorHot else colorNormal
+                  val gpuColor = if (snap.gpuTempC >= 60.0f) colorHot else colorNormal
+                  val batColor = if (snap.batteryTempC >= 40.0f) colorHot else colorNormal
+
+                  appendColored(builder, cpuText, cpuColor)
+                  appendColored(builder, " | ", colorDivider)
+                  appendColored(builder, gpuText, gpuColor)
+                  appendColored(builder, " | ", colorDivider)
+                  appendColored(builder, batText, batColor)
+
+                  return builder
+              }
+
+              private fun appendColored(builder: SpannableStringBuilder, text: String, color: Int) {
+                  val start = builder.length
+                  builder.append(text)
+                  builder.setSpan(ForegroundColorSpan(color), start, builder.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
               }
 
               private fun startMinimalForegroundNotification() {
@@ -394,9 +558,9 @@ jobs:
                       getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
                   }
                   val notification = NotificationCompat.Builder(this, channelId)
-                      .setContentTitle("Exynos 2400e Thermal Monitor")
-                      .setContentText("Shizuku overlay active (0% idle drain)")
-                      .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                      .setContentTitle("S24FE Thermal Monitor")
+                      .setContentText("Hybrid overlay active (0% idle drain)")
+                      .setSmallIcon(R.drawable.ic_launcher_foreground)
                       .setPriority(NotificationCompat.PRIORITY_LOW)
                       .setOngoing(true)
                       .build()
@@ -444,7 +608,7 @@ jobs:
               private val permissionListener = Shizuku.OnRequestPermissionResultListener { _, grantResult ->
                   updateShizukuStatus()
                   if (grantResult == PackageManager.PERMISSION_GRANTED) {
-                      Toast.makeText(this, "Shizuku Permission Granted!", Toast.LENGTH_SHORT).show()
+                      Toast.makeText(this, "Shizuku Authorized! Real sensors unlocked.", Toast.LENGTH_SHORT).show()
                   }
               }
 
@@ -465,12 +629,12 @@ jobs:
                   }
 
                   val shizukuBtn = Button(this).apply {
-                      text = "1. Grant Shizuku Permission"
+                      text = "1. Grant Shizuku (Optional for Exact Sensors)"
                       setOnClickListener { requestShizuku() }
                   }
 
                   val startBtn = Button(this).apply {
-                      text = "2. Start Clear Thermal Overlay"
+                      text = "2. Start Thermal Overlay"
                       setOnClickListener { checkPermissionAndStart() }
                   }
 
@@ -497,14 +661,14 @@ jobs:
               private fun updateShizukuStatus() {
                   val status = try {
                       if (!Shizuku.pingBinder()) {
-                          "Shizuku Status: NOT RUNNING\n(Start Shizuku via Wireless Debugging first)"
+                          "Mode: Hybrid Estimation (~CPU/~GPU)\n(Start Shizuku anytime for 100% exact die sensors)"
                       } else if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
-                          "Shizuku Status: CONNECTED & AUTHORIZED"
+                          "Mode: Exact Hardware Sensors (Shizuku Active)\nRed Alerts: CPU ≥ 65°C | GPU ≥ 60°C | Bat ≥ 40°C"
                       } else {
-                          "Shizuku Status: RUNNING (Tap button 1 to authorize)"
+                          "Shizuku detected! Tap button 1 to unlock exact sensors."
                       }
                   } catch (e: Exception) {
-                      "Shizuku Status: NOT RUNNING"
+                      "Mode: Hybrid Estimation (~CPU/~GPU)"
                   }
                   statusText.text = status
               }
@@ -512,7 +676,7 @@ jobs:
               private fun requestShizuku() {
                   try {
                       if (!Shizuku.pingBinder()) {
-                          Toast.makeText(this, "Start the Shizuku app first!", Toast.LENGTH_LONG).show()
+                          Toast.makeText(this, "Shizuku isn't running—using Hybrid Estimation mode!", Toast.LENGTH_LONG).show()
                           return
                       }
                       if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
@@ -521,7 +685,7 @@ jobs:
                           Toast.makeText(this, "Already authorized!", Toast.LENGTH_SHORT).show()
                       }
                   } catch (e: Exception) {
-                      Toast.makeText(this, "Shizuku is not running", Toast.LENGTH_SHORT).show()
+                      Toast.makeText(this, "Shizuku not active", Toast.LENGTH_SHORT).show()
                   }
               }
 
@@ -553,5 +717,5 @@ jobs:
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: S24FE-Shizuku-Thermal-APK
+          name: S24FE-Hybrid-v4-Thermal-APK
           path: app/build/outputs/apk/debug/app-debug.apk
