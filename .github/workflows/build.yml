@@ -1,0 +1,557 @@
+name: Auto-Build S24FE Shizuku APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.6'
+
+      - name: Generate Shizuku App Source Code
+        run: |
+          mkdir -p app/src/main/java/com/example/exynostemp
+
+          cat << 'EOF' > gradle.properties
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          EOF
+
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "S24FEThermal"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.3.0"
+              id("org.jetbrains.kotlin.android") version "1.9.22"
+          }
+          android {
+              namespace = "com.example.exynostemp"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.exynostemp"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 3
+                  versionName = "3.0-Shizuku"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("androidx.appcompat:appcompat:1.6.1")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="S24FE Thermal"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="com.example.exynostemp.shizuku"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:multiprocess="false"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".ThermalOverlayService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="hardware_thermal_monitor_overlay" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/exynostemp/ExynosThermalReader.kt
+          package com.example.exynostemp
+
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.PackageManager
+          import android.os.BatteryManager
+          import rikka.shizuku.Shizuku
+
+          data class ThermalSnapshot(
+              val cpuTempC: Float?,
+              val gpuTempC: Float?,
+              val socSkinTempC: Float?,
+              val batteryTempC: Float,
+              val shizukuActive: Boolean
+          )
+
+          class ExynosThermalReader(private val context: Context) {
+
+              private val tempLineRegex = Regex("""Temperature\{mValue=([-0-9.]+),\s*mType=([0-9]+),\s*mName=([^,\s}]+)""")
+
+              fun isShizukuReady(): Boolean {
+                  return try {
+                      Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              fun readTemperatures(): ThermalSnapshot {
+                  val batTemp = readBatteryTemp()
+                  if (!isShizukuReady()) {
+                      return ThermalSnapshot(null, null, null, batTemp, false)
+                  }
+
+                  val cpuList = mutableListOf<Float>()
+                  val gpuList = mutableListOf<Float>()
+                  val skinList = mutableListOf<Float>()
+
+                  try {
+                      // Invoke privileged ADB shell command via Shizuku
+                      val newProcessMethod = Shizuku::class.java.getDeclaredMethod(
+                          "newProcess",
+                          Array<String>::class.java,
+                          Array<String>::class.java,
+                          String::class.java
+                      )
+                      newProcessMethod.isAccessible = true
+
+                      val cmd = arrayOf(
+                          "sh", "-c",
+                          "dumpsys thermalservice; echo '---SYSFS---'; " +
+                          "for z in /sys/class/thermal/thermal_zone*; do " +
+                          "echo \"\$(cat \$z/type 2>/dev/null)=\$(cat \$z/temp 2>/dev/null)\"; done"
+                      )
+
+                      val process = newProcessMethod.invoke(null, cmd, null, null) as Process
+                      val output = process.inputStream.bufferedReader().use { it.readText() }
+                      process.waitFor()
+                      process.destroy()
+
+                      var inCurrentHalSection = false
+                      var inSysFsSection = false
+
+                      for (rawLine in output.lineSequence()) {
+                          val line = rawLine.trim()
+                          if (line.startsWith("Current temperatures")) {
+                              inCurrentHalSection = true
+                              continue
+                          }
+                          if (line.startsWith("Current cooling") || line.startsWith("Temperature static") || line.startsWith("Thermal Status")) {
+                              inCurrentHalSection = false
+                          }
+                          if (line == "---SYSFS---") {
+                              inCurrentHalSection = false
+                              inSysFsSection = true
+                              continue
+                          }
+
+                          if (inCurrentHalSection && line.startsWith("Temperature{")) {
+                              val match = tempLineRegex.find(line)
+                              if (match != null) {
+                                  val rawVal = match.groupValues[1].toFloatOrNull() ?: continue
+                                  val type = match.groupValues[2].toIntOrNull() ?: -1
+                                  val name = match.groupValues[3].uppercase()
+                                  val tempC = if (rawVal > 1000f) rawVal / 1000f else rawVal
+
+                                  if (tempC in 15f..115f) {
+                                      when {
+                                          type == 0 || name.contains("BIG") || name.contains("MID") || name.contains("LITTLE") || name.contains("CPU") -> cpuList.add(tempC)
+                                          type == 1 || name.contains("G3D") || name.contains("GPU") -> gpuList.add(tempC)
+                                          type == 3 || name.contains("SKIN") || name.contains("SOC") || name.contains("AP") || name.contains("ISP") || name.contains("NPU") -> skinList.add(tempC)
+                                      }
+                                  }
+                              }
+                          } else if (inSysFsSection && line.contains("=")) {
+                              val parts = line.split("=", limit = 2)
+                              val name = parts[0].uppercase()
+                              val rawVal = parts[1].toFloatOrNull() ?: continue
+                              val tempC = if (rawVal > 1000f) rawVal / 1000f else rawVal
+
+                              if (tempC in 15f..115f) {
+                                  when {
+                                      name.contains("BIG") || name.contains("MID") || name.contains("LITTLE") || name.contains("CPU") -> cpuList.add(tempC)
+                                      name.contains("G3D") || name.contains("GPU") -> gpuList.add(tempC)
+                                      name.contains("SOC") || name.contains("AP") || name.contains("SEC_THERM") -> skinList.add(tempC)
+                                  }
+                              }
+                          }
+                      }
+                  } catch (_: Exception) {}
+
+                  return ThermalSnapshot(
+                      cpuTempC = cpuList.maxOrNull(),
+                      gpuTempC = gpuList.maxOrNull(),
+                      socSkinTempC = skinList.maxOrNull(),
+                      batteryTempC = batTemp,
+                      shizukuActive = true
+                  )
+              }
+
+              private fun readBatteryTemp(): Float {
+                  val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                  val rawTemp = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+                  return rawTemp / 10f
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/exynostemp/ThermalOverlayService.kt
+          package com.example.exynostemp
+
+          import android.app.*
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.os.Build
+          import android.os.IBinder
+          import android.view.*
+          import android.widget.TextView
+          import androidx.core.app.NotificationCompat
+          import androidx.core.content.ContextCompat
+          import kotlinx.coroutines.*
+          import java.util.Locale
+
+          class ThermalOverlayService : Service() {
+              private lateinit var windowManager: WindowManager
+              private lateinit var overlayTextView: TextView
+              private lateinit var thermalReader: ExynosThermalReader
+              private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+              private var pollingJob: Job? = null
+
+              private val screenStateReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      when (intent?.action) {
+                          Intent.ACTION_SCREEN_OFF -> stopPolling()
+                          Intent.ACTION_SCREEN_ON -> startPolling()
+                      }
+                  }
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  thermalReader = ExynosThermalReader(this)
+                  windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  startMinimalForegroundNotification()
+                  setupFloatingOverlay()
+
+                  val filter = IntentFilter().apply {
+                      addAction(Intent.ACTION_SCREEN_OFF)
+                      addAction(Intent.ACTION_SCREEN_ON)
+                  }
+                  ContextCompat.registerReceiver(this, screenStateReceiver, filter, ContextCompat.RECEIVER_EXPORTED)
+                  startPolling()
+              }
+
+              private fun setupFloatingOverlay() {
+                  overlayTextView = TextView(this).apply {
+                      setTextColor(Color.parseColor("#00FFCC"))
+                      textSize = 12f
+                      typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+                      // 100% Clear background with high-contrast black drop shadow for visibility
+                      setBackgroundColor(Color.TRANSPARENT)
+                      setShadowLayer(6f, 2f, 2f, Color.BLACK)
+                      setPadding(12, 6, 12, 6)
+                      text = "Reading S24FE..."
+                  }
+
+                  val layoutParams = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                              WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                              WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = 40
+                      y = 120
+                  }
+
+                  overlayTextView.setOnTouchListener(object : View.OnTouchListener {
+                      private var initialX = 0
+                      private var initialY = 0
+                      private var initialTouchX = 0f
+                      private var initialTouchY = 0f
+                      override fun onTouch(v: View, event: MotionEvent): Boolean {
+                          when (event.action) {
+                              MotionEvent.ACTION_DOWN -> {
+                                  initialX = layoutParams.x
+                                  initialY = layoutParams.y
+                                  initialTouchX = event.rawX
+                                  initialTouchY = event.rawY
+                                  return true
+                              }
+                              MotionEvent.ACTION_MOVE -> {
+                                  layoutParams.x = initialX + (event.rawX - initialTouchX).toInt()
+                                  layoutParams.y = initialY + (event.rawY - initialTouchY).toInt()
+                                  windowManager.updateViewLayout(overlayTextView, layoutParams)
+                                  return true
+                              }
+                          }
+                          return false
+                      }
+                  })
+                  windowManager.addView(overlayTextView, layoutParams)
+              }
+
+              private fun startPolling() {
+                  if (pollingJob?.isActive == true) return
+                  pollingJob = serviceScope.launch {
+                      while (isActive) {
+                          val snap = thermalReader.readTemperatures()
+                          val displayString = buildDisplayText(snap)
+                          withContext(Dispatchers.Main) { overlayTextView.text = displayString }
+                          delay(3000L)
+                      }
+                  }
+              }
+
+              private fun stopPolling() {
+                  pollingJob?.cancel()
+                  pollingJob = null
+              }
+
+              private fun buildDisplayText(snap: ThermalSnapshot): String {
+                  if (!snap.shizukuActive) {
+                      return String.format(Locale.US, "[No Shizuku] Bat: %.1f°C", snap.batteryTempC)
+                  }
+                  val cpu = snap.cpuTempC ?: snap.socSkinTempC
+                  val gpu = snap.gpuTempC ?: snap.socSkinTempC
+                  val cpuStr = cpu?.let { String.format(Locale.US, "%.1f°C", it) } ?: "--"
+                  val gpuStr = gpu?.let { String.format(Locale.US, "%.1f°C", it) } ?: "--"
+                  val batStr = String.format(Locale.US, "%.1f°C", snap.batteryTempC)
+                  return "CPU: $cpuStr | GPU: $gpuStr | Bat: $batStr"
+              }
+
+              private fun startMinimalForegroundNotification() {
+                  val channelId = "thermal_overlay_channel"
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(channelId, "Thermal Overlay", NotificationManager.IMPORTANCE_LOW)
+                      getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+                  }
+                  val notification = NotificationCompat.Builder(this, channelId)
+                      .setContentTitle("Exynos 2400e Thermal Monitor")
+                      .setContentText("Shizuku overlay active (0% idle drain)")
+                      .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                      .setPriority(NotificationCompat.PRIORITY_LOW)
+                      .setOngoing(true)
+                      .build()
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                      startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, notification)
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  stopPolling()
+                  serviceScope.cancel()
+                  unregisterReceiver(screenStateReceiver)
+                  if (::overlayTextView.isInitialized) windowManager.removeView(overlayTextView)
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/exynostemp/MainActivity.kt
+          package com.example.exynostemp
+
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+          import rikka.shizuku.Shizuku
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var statusText: TextView
+
+              private val permissionListener = Shizuku.OnRequestPermissionResultListener { _, grantResult ->
+                  updateShizukuStatus()
+                  if (grantResult == PackageManager.PERMISSION_GRANTED) {
+                      Toast.makeText(this, "Shizuku Permission Granted!", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Shizuku.addRequestPermissionResultListener(permissionListener)
+
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(64, 64, 64, 64)
+                  }
+
+                  statusText = TextView(this).apply {
+                      textSize = 15f
+                      gravity = Gravity.CENTER
+                      setPadding(0, 0, 0, 48)
+                  }
+
+                  val shizukuBtn = Button(this).apply {
+                      text = "1. Grant Shizuku Permission"
+                      setOnClickListener { requestShizuku() }
+                  }
+
+                  val startBtn = Button(this).apply {
+                      text = "2. Start Clear Thermal Overlay"
+                      setOnClickListener { checkPermissionAndStart() }
+                  }
+
+                  val stopBtn = Button(this).apply {
+                      text = "Stop Thermal Overlay"
+                      setOnClickListener {
+                          stopService(Intent(this@MainActivity, ThermalOverlayService::class.java))
+                      }
+                  }
+
+                  layout.addView(statusText)
+                  layout.addView(shizukuBtn)
+                  layout.addView(startBtn)
+                  layout.addView(stopBtn)
+                  setContentView(layout)
+                  updateShizukuStatus()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  updateShizukuStatus()
+              }
+
+              private fun updateShizukuStatus() {
+                  val status = try {
+                      if (!Shizuku.pingBinder()) {
+                          "Shizuku Status: NOT RUNNING\n(Start Shizuku via Wireless Debugging first)"
+                      } else if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
+                          "Shizuku Status: CONNECTED & AUTHORIZED"
+                      } else {
+                          "Shizuku Status: RUNNING (Tap button 1 to authorize)"
+                      }
+                  } catch (e: Exception) {
+                      "Shizuku Status: NOT RUNNING"
+                  }
+                  statusText.text = status
+              }
+
+              private fun requestShizuku() {
+                  try {
+                      if (!Shizuku.pingBinder()) {
+                          Toast.makeText(this, "Start the Shizuku app first!", Toast.LENGTH_LONG).show()
+                          return
+                      }
+                      if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+                          Shizuku.requestPermission(1001)
+                      } else {
+                          Toast.makeText(this, "Already authorized!", Toast.LENGTH_SHORT).show()
+                      }
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Shizuku is not running", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun checkPermissionAndStart() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "Grant 'Appear on top' permission first", Toast.LENGTH_LONG).show()
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  } else {
+                      val serviceIntent = Intent(this, ThermalOverlayService::class.java)
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          startForegroundService(serviceIntent)
+                      } else {
+                          startService(serviceIntent)
+                      }
+                      finish()
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  Shizuku.removeRequestPermissionResultListener(permissionListener)
+              }
+          }
+          EOF
+
+      - name: Build Debug APK
+        run: gradle assembleDebug
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: S24FE-Shizuku-Thermal-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
