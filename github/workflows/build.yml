@@ -1,0 +1,427 @@
+name: Auto-Build S24FE APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.6'
+
+      - name: Generate Entire App Source Code
+        run: |
+          mkdir -p app/src/main/java/com/example/exynostemp
+
+          cat << 'EOF' > gradle.properties
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          EOF
+
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "S24FEThermal"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.3.0"
+              id("org.jetbrains.kotlin.android") version "1.9.22"
+          }
+          android {
+              namespace = "com.example.exynostemp"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.exynostemp"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("androidx.appcompat:appcompat:1.6.1")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="S24FE Thermal"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".ThermalOverlayService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="hardware_thermal_monitor_overlay" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/exynostemp/ExynosThermalReader.kt
+          package com.example.exynostemp
+
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.os.BatteryManager
+          import android.os.Build
+          import android.os.PowerManager
+          import java.io.File
+          import java.io.RandomAccessFile
+
+          data class ThermalSnapshot(
+              val cpuTempC: Float?,
+              val gpuTempC: Float?,
+              val batteryTempC: Float,
+              val thermalLoadPercent: Int?
+          )
+
+          class ExynosThermalReader(private val context: Context) {
+              private var cpuTempFile: File? = null
+              private var gpuTempFile: File? = null
+              private var lastHeadroomCallTime = 0L
+              private var cachedHeadroomPercent: Int? = null
+              private val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+
+              init { discoverExynosSensors() }
+
+              private fun discoverExynosSensors() {
+                  val thermalDir = File("/sys/class/thermal")
+                  if (!thermalDir.exists() || !thermalDir.canRead()) return
+                  thermalDir.listFiles()?.forEach { zone ->
+                      val typeFile = File(zone, "type")
+                      val tempFile = File(zone, "temp")
+                      if (typeFile.canRead() && tempFile.canRead()) {
+                          val type = runCatching { typeFile.readText().trim().uppercase() }.getOrNull() ?: ""
+                          if (cpuTempFile == null && (type.contains("BIG") || type.contains("CPU") || type.contains("SOC"))) {
+                              cpuTempFile = tempFile
+                          }
+                          if (gpuTempFile == null && (type.contains("G3D") || type.contains("GPU"))) {
+                              gpuTempFile = tempFile
+                          }
+                      }
+                  }
+              }
+
+              fun readTemperatures(): ThermalSnapshot {
+                  val cpu = cpuTempFile?.let { readSysFsTemp(it) }
+                  val gpu = gpuTempFile?.let { readSysFsTemp(it) }
+                  val battery = readBatteryTemp()
+                  val headroom = readThermalHeadroom()
+                  return ThermalSnapshot(cpu, gpu, battery, headroom)
+              }
+
+              private fun readSysFsTemp(file: File): Float? {
+                  return try {
+                      RandomAccessFile(file, "r").use { raf ->
+                          val raw = raf.readLine()?.trim()?.toFloatOrNull() ?: return null
+                          if (raw > 1000f) raw / 1000f else raw
+                      }
+                  } catch (e: Exception) { null }
+              }
+
+              private fun readBatteryTemp(): Float {
+                  val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                  val rawTemp = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
+                  return rawTemp / 10f
+              }
+
+              private fun readThermalHeadroom(): Int? {
+                  val now = System.currentTimeMillis()
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (now - lastHeadroomCallTime > 10_500L)) {
+                      lastHeadroomCallTime = now
+                      val headroom = powerManager.getThermalHeadroom(0)
+                      if (!headroom.isNaN() && headroom > 0f) {
+                          cachedHeadroomPercent = (headroom * 100).toInt()
+                      }
+                  }
+                  return cachedHeadroomPercent
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/exynostemp/ThermalOverlayService.kt
+          package com.example.exynostemp
+
+          import android.app.*
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.IBinder
+          import android.view.*
+          import android.widget.TextView
+          import androidx.core.app.NotificationCompat
+          import androidx.core.content.ContextCompat
+          import kotlinx.coroutines.*
+          import java.util.Locale
+
+          class ThermalOverlayService : Service() {
+              private lateinit var windowManager: WindowManager
+              private lateinit var overlayTextView: TextView
+              private lateinit var thermalReader: ExynosThermalReader
+              private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+              private var pollingJob: Job? = null
+
+              private val screenStateReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      when (intent?.action) {
+                          Intent.ACTION_SCREEN_OFF -> stopPolling()
+                          Intent.ACTION_SCREEN_ON -> startPolling()
+                      }
+                  }
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  thermalReader = ExynosThermalReader(this)
+                  windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  startMinimalForegroundNotification()
+                  setupFloatingOverlay()
+
+                  val filter = IntentFilter().apply {
+                      addAction(Intent.ACTION_SCREEN_OFF)
+                      addAction(Intent.ACTION_SCREEN_ON)
+                  }
+                  ContextCompat.registerReceiver(this, screenStateReceiver, filter, ContextCompat.RECEIVER_EXPORTED)
+                  startPolling()
+              }
+
+              private fun setupFloatingOverlay() {
+                  overlayTextView = TextView(this).apply {
+                      setTextColor(Color.parseColor("#00FFCC"))
+                      textSize = 11f
+                      typeface = Typeface.MONOSPACE
+                      setPadding(24, 12, 24, 12)
+                      background = GradientDrawable().apply {
+                          setColor(Color.parseColor("#CC121212"))
+                          cornerRadius = 24f
+                      }
+                      text = "Init S24FE..."
+                  }
+
+                  val layoutParams = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                              WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                              WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = 40
+                      y = 120
+                  }
+
+                  overlayTextView.setOnTouchListener(object : View.OnTouchListener {
+                      private var initialX = 0
+                      private var initialY = 0
+                      private var initialTouchX = 0f
+                      private var initialTouchY = 0f
+                      override fun onTouch(v: View, event: MotionEvent): Boolean {
+                          when (event.action) {
+                              MotionEvent.ACTION_DOWN -> {
+                                  initialX = layoutParams.x
+                                  initialY = layoutParams.y
+                                  initialTouchX = event.rawX
+                                  initialTouchY = event.rawY
+                                  return true
+                              }
+                              MotionEvent.ACTION_MOVE -> {
+                                  layoutParams.x = initialX + (event.rawX - initialTouchX).toInt()
+                                  layoutParams.y = initialY + (event.rawY - initialTouchY).toInt()
+                                  windowManager.updateViewLayout(overlayTextView, layoutParams)
+                                  return true
+                              }
+                          }
+                          return false
+                      }
+                  })
+                  windowManager.addView(overlayTextView, layoutParams)
+              }
+
+              private fun startPolling() {
+                  if (pollingJob?.isActive == true) return
+                  pollingJob = serviceScope.launch {
+                      while (isActive) {
+                          val snap = thermalReader.readTemperatures()
+                          val displayString = buildDisplayText(snap)
+                          withContext(Dispatchers.Main) { overlayTextView.text = displayString }
+                          delay(3000L)
+                      }
+                  }
+              }
+
+              private fun stopPolling() {
+                  pollingJob?.cancel()
+                  pollingJob = null
+              }
+
+              private fun buildDisplayText(snap: ThermalSnapshot): String {
+                  return if (snap.cpuTempC != null || snap.gpuTempC != null) {
+                      val cpuStr = snap.cpuTempC?.let { String.format(Locale.US, "%.1f°C", it) } ?: "--"
+                      val gpuStr = snap.gpuTempC?.let { String.format(Locale.US, "%.1f°C", it) } ?: "--"
+                      "CPU: $cpuStr | GPU: $gpuStr"
+                  } else {
+                      val skinStr = String.format(Locale.US, "%.1f°C", snap.batteryTempC)
+                      val loadStr = snap.thermalLoadPercent?.let { " | Load: $it%" } ?: ""
+                      "SoC/Bat: $skinStr$loadStr"
+                  }
+              }
+
+              private fun startMinimalForegroundNotification() {
+                  val channelId = "thermal_overlay_channel"
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(channelId, "Thermal Overlay", NotificationManager.IMPORTANCE_LOW)
+                      getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+                  }
+                  val notification = NotificationCompat.Builder(this, channelId)
+                      .setContentTitle("Exynos 2400e Thermal Monitor")
+                      .setContentText("Overlay active (pauses when screen is off)")
+                      .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                      .setPriority(NotificationCompat.PRIORITY_LOW)
+                      .setOngoing(true)
+                      .build()
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                      startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, notification)
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  stopPolling()
+                  serviceScope.cancel()
+                  unregisterReceiver(screenStateReceiver)
+                  if (::overlayTextView.isInitialized) windowManager.removeView(overlayTextView)
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/exynostemp/MainActivity.kt
+          package com.example.exynostemp
+
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+
+          class MainActivity : AppCompatActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(64, 64, 64, 64)
+                  }
+                  val startBtn = Button(this).apply {
+                      text = "Start Thermal Overlay"
+                      setOnClickListener { checkPermissionAndStart() }
+                  }
+                  val stopBtn = Button(this).apply {
+                      text = "Stop Thermal Overlay"
+                      setOnClickListener {
+                          stopService(Intent(this@MainActivity, ThermalOverlayService::class.java))
+                      }
+                  }
+                  layout.addView(startBtn)
+                  layout.addView(stopBtn)
+                  setContentView(layout)
+              }
+
+              private fun checkPermissionAndStart() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "Grant 'Appear on top' permission first", Toast.LENGTH_LONG).show()
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  } else {
+                      val serviceIntent = Intent(this, ThermalOverlayService::class.java)
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          startForegroundService(serviceIntent)
+                      } else {
+                          startService(serviceIntent)
+                      }
+                      finish()
+                  }
+              }
+          }
+          EOF
+
+      - name: Build Debug APK
+        run: gradle assembleDebug
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: S24FE-Thermal-Monitor-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
